@@ -127,10 +127,25 @@ ufshci_ctrlr_start(struct ufshci_controller *ctrlr, bool resetting)
 
 	ufshci_dev_init_uic_link_state(ctrlr);
 
-	if ((ctrlr->quirks & UFSHCI_QUIRK_REINIT_AFTER_MAX_GEAR_SWITCH) &&
-	    ufshci_ctrlr_reinit_after_max_gear_switch(ctrlr) != 0) {
-		ufshci_ctrlr_fail(ctrlr);
-		return;
+	if (ctrlr->quirks & UFSHCI_QUIRK_REINIT_AFTER_MAX_GEAR_SWITCH) {
+		uint32_t probe;
+
+		/*
+		 * The reinit is only needed when the link did not survive
+		 * the gear switch. A local readback still shows HS when the
+		 * peer is dead. Only peer traffic proves the link works.
+		 */
+		if (ufshci_uic_send_dme_peer_get(ctrlr, PA_Granularity,
+		    &probe) != 0) {
+			ufshci_printf(ctrlr,
+			    "link probe failed after the gear switch, "
+			    "reinitializing\n");
+			if (ufshci_ctrlr_reinit_after_max_gear_switch(
+			    ctrlr) != 0) {
+				ufshci_ctrlr_fail(ctrlr);
+				return;
+			}
+		}
 	}
 
 	/* Read Controller Descriptor (Device, Geometry) */
@@ -374,6 +389,13 @@ ufshci_ctrlr_construct(struct ufshci_controller *ctrlr, device_t dev)
 	}
 	if (!(ctrlr->is_single_db_supported || ctrlr->is_mcq_supported))
 		return (ENXIO);
+
+	/* Every device table entry must name the HS series. */
+	if (ctrlr->hs_series == 0) {
+		ufshci_printf(ctrlr,
+		    "hs_series is missing from the device table\n");
+		return (ENXIO);
+	}
 
 	/*
 	 * The maximum transfer size supported by UFSHCI spec is 65535 * 256 KiB
