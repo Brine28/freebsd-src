@@ -491,7 +491,11 @@
         ..
         dhclient
         ..
+        fsck_msdosfs
+        ..
         growfs
+        ..
+        hastd
         ..
         ifconfig
         ..
@@ -868,6 +872,8 @@
                     ..
                 ..
                 virstor
+                ..
+                zoned
                 ..
             ..
         ..
@@ -1320,6 +1326,8 @@
         sysrc
         ..
         traceroute
+        ..
+        zonectl
         ..
     ..
 ..

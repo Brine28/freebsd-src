@@ -176,6 +176,8 @@ static void bce_vhci_handle_transfer_request(struct bce_vhci_softc *vhci,
     struct bce_vhci_message *msg);
 static void bce_vhci_complete_ctrl_locked(struct bce_vhci_softc *vhci,
     struct bce_vhci_transfer_queue *tq, struct bce_vhci_message *msg);
+static void bce_vhci_ctrl_start_in_data(struct bce_vhci_softc *vhci,
+    struct bce_vhci_transfer_queue *tq);
 static void bce_vhci_handle_ctrl_status(struct bce_vhci_softc *vhci,
     struct bce_vhci_message *msg);
 static uint16_t bce_vhci_handle_endpoint_req_state(struct bce_vhci_softc *vhci,
@@ -1007,7 +1009,11 @@ bce_vhci_port_chg_task(void *arg, int pending __unused)
 
 		USB_BUS_LOCK(&vhci->sc_bus);
 		if (error == 0) {
+			uint16_t changed, old_status;
+
 			port_status = (uint32_t)reply.param2;
+
+			old_status = vhci->sc_port_status[port];
 
 			vhci->sc_port_status[port] = 0;
 			if (vhci->sc_port_power[port])
@@ -1025,8 +1031,24 @@ bce_vhci_port_chg_task(void *arg, int pending __unused)
 			if (port_status & BCE_VHCI_PORT_OVERCURRENT)
 				vhci->sc_port_status[port] |=
 				    UPS_OVERCURRENT_INDICATOR;
+
+			changed = old_status ^ vhci->sc_port_status[port];
+
+			if (changed & UPS_CURRENT_CONNECT_STATUS)
+				vhci->sc_port_change[port] |=
+				    UPS_C_CONNECT_STATUS;
+			if (changed & UPS_PORT_ENABLED)
+				vhci->sc_port_change[port] |=
+				    UPS_C_PORT_ENABLED;
+			if (changed & UPS_SUSPEND)
+				vhci->sc_port_change[port] |=
+				    UPS_C_SUSPEND;
+			if (changed & UPS_OVERCURRENT_INDICATOR)
+				vhci->sc_port_change[port] |=
+				    UPS_C_OVERCURRENT_INDICATOR;
+		} else {
+			vhci->sc_port_change[port] |= UPS_C_CONNECT_STATUS;
 		}
-		vhci->sc_port_change[port] |= UPS_C_CONNECT_STATUS;
 		USB_BUS_UNLOCK(&vhci->sc_bus);
 	}
 
@@ -1623,6 +1645,71 @@ bce_vhci_submit_pending_out(struct bce_vhci_softc *vhci,
 	}
 }
 
+static void
+bce_vhci_ctrl_start_in_data(struct bce_vhci_softc *vhci,
+    struct bce_vhci_transfer_queue *tq)
+{
+	struct bce_vhci_message treq;
+	struct bce_qe_submission *si;
+	struct usb_xfer *xfer;
+	uint32_t dlen;
+
+	dlen = tq->ctrl_data_len;
+	if (dlen > BCE_VHCI_XFER_BUFSZ)
+		dlen = BCE_VHCI_XFER_BUFSZ;
+
+	xfer = tq->active_xfer;
+	tq->ctrl_state = BCE_VHCI_CTRL_STATUS;
+	USB_BUS_UNLOCK(&vhci->sc_bus);
+
+	memset(&treq, 0, sizeof(treq));
+	treq.cmd = BCE_VHCI_CMD_TRANSFER_REQUEST;
+	treq.param1 = ((uint32_t)tq->endp_addr << 8) | tq->dev_addr;
+	treq.param2 = dlen;
+
+	bus_dmamap_sync(tq->dma_tag, tq->dma_map, BUS_DMASYNC_PREREAD);
+
+	mtx_lock_spin(&vhci->sc_async_lock);
+	if (bce_reserve_submission(vhci->msg_asynchronous.sq) != 0) {
+		mtx_unlock_spin(&vhci->sc_async_lock);
+		goto fail;
+	}
+	mtx_unlock_spin(&vhci->sc_async_lock);
+
+	mtx_lock_spin(&tq->lock);
+	if (bce_reserve_submission(tq->sq_in) != 0) {
+		mtx_unlock_spin(&tq->lock);
+		mtx_lock_spin(&vhci->sc_async_lock);
+		atomic_add_int(
+		    &vhci->msg_asynchronous.sq->available_commands, 1);
+		mtx_unlock_spin(&vhci->sc_async_lock);
+		goto fail;
+	}
+	si = bce_next_submission(tq->sq_in);
+	si->addr = tq->dma_addr;
+	si->length = dlen;
+	si->segl_addr = 0;
+	si->segl_length = 0;
+	bce_submit_to_device(vhci->sc_bce, tq->sq_in);
+	mtx_unlock_spin(&tq->lock);
+
+	mtx_lock_spin(&vhci->sc_async_lock);
+	bce_vhci_msg_queue_write(vhci, &vhci->msg_asynchronous, &treq);
+	mtx_unlock_spin(&vhci->sc_async_lock);
+
+	USB_BUS_LOCK(&vhci->sc_bus);
+	return;
+
+fail:
+	USB_BUS_LOCK(&vhci->sc_bus);
+	if (tq->active_xfer == xfer) {
+		tq->active_xfer = NULL;
+		tq->dma_inflight = 0;
+		tq->ctrl_state = BCE_VHCI_CTRL_IDLE;
+		usbd_transfer_done(xfer, USB_ERR_IOERROR);
+	}
+}
+
 /*
  * Transfer queue DMA completion callback.  Fires when the firmware
  * has consumed (OUT) or filled (IN) a DMA buffer we submitted.
@@ -1771,6 +1858,9 @@ bce_vhci_tq_completion(struct bce_queue_sq *sq)
 					    vhci, tq,
 					    &tq->ctrl_status_msg);
 				}
+				if (tq->ctrl_state == BCE_VHCI_CTRL_DATA &&
+				    tq->ctrl_dir == UE_DIR_IN)
+					bce_vhci_ctrl_start_in_data(vhci, tq);
 			} else if (tq->ctrl_state ==
 			    BCE_VHCI_CTRL_STATUS &&
 			    tq->ctrl_dir == UE_DIR_OUT) {
@@ -2887,6 +2977,11 @@ bce_vhci_handle_transfer_request(struct bce_vhci_softc *vhci,
 
 		break;
 	}
+
+	case BCE_VHCI_CTRL_STATUS:
+		if (bus_locked == 0)
+			USB_BUS_UNLOCK(&vhci->sc_bus);
+		break;
 
 	default:
 		device_printf(vhci->sc_dev,
@@ -4102,6 +4197,8 @@ bce_vhci_roothub_exec(struct usb_device *udev,
 					    UPS_HIGH_SPEED;
 					vhci->sc_port_change[index - 1] |=
 					    UPS_C_PORT_RESET;
+					vhci->sc_port_change[index - 1] &=
+					    ~UPS_C_CONNECT_STATUS;
 				} else {
 					device_printf(vhci->sc_dev,
 					    "port %d reset failed: %d\n",
@@ -4689,6 +4786,12 @@ bce_vhci_attach_dev(device_t dev)
 
 	device_printf(dev, "BCE VHCI attached, %d ports\n",
 	    vhci->sc_port_count);
+
+	/* Kick the USB explore thread to enumerate initially connected ports */
+	USB_BUS_LOCK(&vhci->sc_bus);
+	usb_needs_explore(&vhci->sc_bus, 0);
+	USB_BUS_UNLOCK(&vhci->sc_bus);
+
 	return (0);
 
 fail_child:
